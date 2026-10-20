@@ -1,0 +1,14 @@
+{
+  "debounce_time": {
+    "description": "防抖等待时间（秒）",
+    "type": "float",
+    "default": 1.5,
+    "hint": "用户停止发送消息后，等待多久再合并发给大模型。如果经常回复两次，可以适当调大（如 2.0）。"
+  },
+  "max_messages": {
+    "description": "单次最大合并消息条数",
+    "type": "int",
+    "default": 10,
+    "hint": "防止恶意刷屏导致机器人卡死，建议 5 - 15 之间。"
+  }
+}

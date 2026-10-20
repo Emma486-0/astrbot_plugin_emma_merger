@@ -1,24 +1,94 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
+import asyncio
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+from astrbot.api.message_components import Plain, At
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
-    def __init__(self, context: Context):
+@register("astrbot_plugin_emma_merger", "Emma486-0", "多模态防抖合并插件", "1.0.0")
+class EmmaMergerPlugin(Star):
+    def __init__(self, context: Context, config: dict):
         super().__init__(context)
+        self.config = config
+        self.message_bursts = {}
+        self.pending_tasks = {}
+        
+        # 从配置文件读取，如果没有则用默认值
+        self.debounce_time = self.config.get("debounce_time", 1.5)
+        self.max_messages = self.config.get("max_messages", 10)
 
-    async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+    def _get_burst_key(self, event: AstrMessageEvent) -> str:
+        sender_id = event.get_sender_id()
+        group_id = event.get_group_id() or "private"
+        return f"{event.get_platform_id()}_{group_id}_{sender_id}"
 
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+    @filter.regex(r"^[\s\S]*$", priority=10000)
+    async def early_catch(self, event: AstrMessageEvent):
+        if event.message_str.startswith(("/", "!")):
+            return
 
-    async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        burst_key = self._get_burst_key(event)
+        if burst_key not in self.message_bursts:
+            self.message_bursts[burst_key] = []
+        
+        # 防刷屏限制
+        if len(self.message_bursts[burst_key]) < self.max_messages:
+            self.message_bursts[burst_key].append(event.message_obj.message)
+        else:
+            print(f"[Emma Merger] 用户 {burst_key} 发送过快，已达到最大条数 {self.max_messages}，忽略当前消息。")
+
+    @filter.on_waiting_llm_request(priority=1000)
+    async def on_waiting_llm(self, event: AstrMessageEvent):
+        burst_key = self._get_burst_key(event)
+        current_task = asyncio.current_task()
+        
+        old_task = self.pending_tasks.get(burst_key)
+        if old_task and old_task != current_task and not old_task.done():
+            old_task.cancel()
+
+        self.pending_tasks[burst_key] = current_task
+        
+        try:
+            await asyncio.sleep(self.debounce_time)
+        except asyncio.CancelledError:
+            event.stop_event() 
+            return
+            
+        if self.pending_tasks.get(burst_key) != current_task:
+            event.stop_event()
+            return
+
+        if burst_key not in self.message_bursts:
+            return
+            
+        chains = self.message_bursts[burst_key]
+        if len(chains) == 0:
+            return
+
+        merged_chain = []
+        current_text = ""
+        
+        for chain in chains:
+            for comp in chain:
+                if isinstance(comp, At) and str(getattr(comp, "qq", "")) == str(event.get_self_id()):
+                    continue
+                if isinstance(comp, Plain):
+                    current_text += comp.text
+                else:
+                    if current_text:
+                        merged_chain.append(Plain(current_text))
+                        current_text = ""
+                    merged_chain.append(comp)
+        
+        if current_text:
+            merged_chain.append(Plain(current_text))
+
+        merged_text = "".join([c.text for c in merged_chain if isinstance(c, Plain)])
+
+        event.message_obj.message = merged_chain
+        event.message_obj.message_str = merged_text
+        event.message_str = merged_text
+        
+        print(f"[Emma Merger] 合并完成！包含 {len(chains)} 条消息。")
+
+        del self.message_bursts[burst_key]
+        if burst_key in self.pending_tasks:
+            del self.pending_tasks[burst_key]
